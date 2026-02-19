@@ -1,51 +1,26 @@
-name: Bedrock server -> Discord webhook (post on player-count change)
+name: Bedrock server -> Discord webhook
 
 on:
   schedule:
-    - cron: '*/10 * * * *'   # every 10 minutes
-  workflow_dispatch:         # manual trigger
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
 
 jobs:
   check-servers:
     runs-on: ubuntu-latest
     env:
       DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      - uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install jq
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y jq curl python3
+          sudo apt-get install -y jq curl
 
-      - name: Query servers and post to Discord when player count changes
-        shell: bash
+      - name: Query servers and post
         run: |
           set -euo pipefail
-
-          FILE="servers.txt"
-          STATUS_FILE="server_status.json"
-
-          # initialize status json if missing
-          if [ ! -f "$STATUS_FILE" ]; then
-            echo '{}' > "$STATUS_FILE"
-            git add "$STATUS_FILE" || true
-            git commit -m "Create server_status.json [skip ci]" || true
-          fi
-
-          if [ ! -f "$FILE" ]; then
-            echo "Error: $FILE not found in repo root."
-            exit 1
-          fi
-
-          # read the existing status JSON
-          status_json="$(cat "$STATUS_FILE")"
-
-          changed=0
 
           while IFS= read -r rawline || [ -n "$rawline" ]; do
             line="${rawline%%#*}"
@@ -59,14 +34,10 @@ jobs:
               port="${line##*:}"
             fi
 
-            api_url="https://api.mcsrvstat.us/bedrock/2/${host}:${port}"
-            echo "Querying $api_url"
-            resp="$(curl -sS --max-time 15 "$api_url")" || {
-              echo "Warning: failed to fetch $api_url"
-              continue
-            }
+            api="https://api.mcsrvstat.us/bedrock/2/${host}:${port}"
+            resp="$(curl -sS --max-time 15 "$api")" || continue
 
-            motd_raw="$(echo "$resp" | jq -r '
+            motd="$(echo "$resp" | jq -r '
               if (.motd? and (.motd.clean? and (.motd.clean | type) == "array")) then
                 (.motd.clean | join(" "))
               elif (.motd? and (.motd.clean? and (.motd.clean | type) == "string")) then
@@ -80,72 +51,30 @@ jobs:
               end
             ')"
 
-            # decode HTML entities reliably
-            motd_decoded="$(python3 - <<'PY' -- "$motd_raw"
-import html,sys
-print(html.unescape(sys.argv[1] if len(sys.argv) > 1 else ""))
-PY
-)"
+            # Decode common HTML entities safely
+            motd="${motd//&#039;/' }"
+            motd="${motd//&amp;/&}"
+            motd="${motd//&lt;/<}"
+            motd="${motd//&gt;/>}"
 
-            ip="$(echo "$resp" | jq -r --arg default "$host" '.ip // $default')"
-            port_out="$(echo "$resp" | jq -r --arg default "$port" '.port // $default')"
-            players_online="$(echo "$resp" | jq -r '.players.online // 0')"
-            players_max="$(echo "$resp" | jq -r '.players.max // 0')"
+            ip="$(echo "$resp" | jq -r --arg d "$host" '.ip // $d')"
+            port_out="$(echo "$resp" | jq -r --arg d "$port" '.port // $d')"
+            online="$(echo "$resp" | jq -r '.players.online // 0')"
+            max="$(echo "$resp" | jq -r '.players.max // 0')"
 
             epoch="$(date +%s)"
-            discord_time_tag="<t:${epoch}:t>"
 
-            key="${host}:${port_out}"
+            printf -v message "%s\n%s\n%s\n%s\n" \
+              "Server name: ${motd}" \
+              "Address: ${ip}" \
+              "Port: ${port_out}" \
+              "Player Count (as of <t:${epoch}:t>): ${online}/${max}"
 
-            # get previous players_online from status_json (default -1 if not present)
-            prev_online="$(echo "$status_json" | jq -r --arg k "$key" 'if .[$k] then (.[$k].players_online|tostring) else "-1" end')"
+            payload="$(jq -nc --arg content "$message" '{content:$content}')"
 
-            post_now=0
-            if [ "$prev_online" = "-1" ]; then
-              # no prior record -> treat as first run and post
-              post_now=1
-            elif [ "$prev_online" != "$players_online" ]; then
-              post_now=1
-            fi
-
-            if [ "$post_now" -eq 1 ]; then
-              printf -v message "%s\n%s\n%s\n%s\n" \
-                "Server name: ${motd_decoded}" \
-                "Address: ${ip}" \
-                "Port: ${port_out}" \
-                "Player Count (as of ${discord_time_tag}): ${players_online}/${players_max}"
-
-              payload="$(jq -nc --arg content "$message" '{content: $content}')"
-
-              http_code="$(curl -sS -o /dev/null -w "%{http_code}" -H "Content-Type: application/json" -d "$payload" "$DISCORD_WEBHOOK" || echo "000")"
-              if [[ "$http_code" == "200" || "$http_code" == "204" ]]; then
-                echo "Posted $key -> Discord (HTTP $http_code) (prev_online=${prev_online})"
-              else
-                echo "Warning: webhook POST returned HTTP $http_code for $key"
-              fi
-            else
-              echo "No change for $key (players ${players_online}); skipping post."
-            fi
-
-            # update status_json with new values for this server
-            status_json="$(echo "$status_json" | jq --arg k "$key" --argjson online "$players_online" --argjson max "$players_max" --arg epoch "$epoch" '. + {($k): {players_online: $online, players_max: $max, last_checked: ($epoch|tonumber)}}')"
-            changed=1
+            curl -sS -H "Content-Type: application/json" \
+                 -d "$payload" \
+                 "$DISCORD_WEBHOOK" >/dev/null
 
             sleep 1
-          done < "$FILE"
-
-          # write back the updated status_json
-          echo "$status_json" > "$STATUS_FILE"
-
-          # commit & push only if there are changes
-          if [[ -n "$(git status --porcelain)" ]]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add "$STATUS_FILE"
-            git commit -m "Update server_status.json [skip ci]" || echo "Commit failed or no changes"
-            # push using GITHUB_TOKEN
-            repo_url="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-            git push "$repo_url" HEAD:$(git rev-parse --abbrev-ref HEAD) || echo "Push failed (protected branch?)"
-          else
-            echo "No changes to commit."
-          fi
+          done < servers.txt
