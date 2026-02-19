@@ -53,7 +53,7 @@ jobs:
             motd="$(echo "$resp" | jq -r '(.motd.clean // .motd.raw // .hostname // "Unknown") | if type=="array" then join(" ") else . end')"
 
             # Minimal HTML entity fix for apostrophes
-            motd="${motd//&#039;/'}"
+            motd="$(printf '%s' "$motd" | sed "s/&#039;/'/g")"
 
             ip="$(echo "$resp" | jq -r --arg default "$host" '.ip // $default')"
             port_out="$(echo "$resp" | jq -r --arg default "$port" '.port // $default')"
