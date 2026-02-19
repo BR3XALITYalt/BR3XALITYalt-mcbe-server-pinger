@@ -11,33 +11,46 @@ jobs:
     env:
       DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-      - name: Install jq
+      - name: Install jq and curl
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq curl
 
-      - name: Query servers and post
+      - name: Query servers and post to Discord
         run: |
-          set -euo pipefail
+          set -u
+          FILE="servers.txt"
+          if [ ! -f "$FILE" ]; then
+            echo "Error: $FILE not found in repo root."
+            exit 1
+          fi
 
           while IFS= read -r rawline || [ -n "$rawline" ]; do
+            # Remove comments and trim whitespace
             line="${rawline%%#*}"
             line="$(echo -n "$line" | tr -d '\r' | xargs || true)"
             [ -z "$line" ] && continue
 
+            # Parse host and port (default Bedrock port 19132)
             host="$line"
             port="19132"
-            if [[ "$line" == *:* ]]; then
+            if echo "$line" | grep -q ":"; then
               host="${line%%:*}"
               port="${line##*:}"
             fi
 
-            api="https://api.mcsrvstat.us/bedrock/2/${host}:${port}"
-            resp="$(curl -sS --max-time 15 "$api")" || continue
+            api_url="https://api.mcsrvstat.us/bedrock/2/${host}:${port}"
+            echo "Querying $api_url"
+            resp="$(curl -sS --max-time 15 "$api_url")" || {
+              echo "Warning: failed to fetch $api_url"
+              continue
+            }
 
-            motd="$(echo "$resp" | jq -r '
+            # Extract raw MOTD with jq (handles different response formats)
+            motd_raw="$(echo "$resp" | jq -r '
               if (.motd? and (.motd.clean? and (.motd.clean | type) == "array")) then
                 (.motd.clean | join(" "))
               elif (.motd? and (.motd.clean? and (.motd.clean | type) == "string")) then
@@ -47,37 +60,43 @@ jobs:
               elif .hostname? then
                 .hostname
               else
-                "Unknown"
-              end
+                empty
+              end // "Unknown"
             ')"
 
-            # Decode common HTML entities safely
-            motd="${motd//&#039;/' }"
-            motd="${motd//&amp;/&}"
-            motd="${motd//&lt;/<}"
-            motd="${motd//&gt;/>}"
+            # Decode HTML entities (e.g., &#039; → ')
+            motd="$(echo "$motd_raw" | python3 -c '
+import sys, html
+try:
+    print(html.unescape(sys.stdin.read().strip()), end="")
+except:
+    sys.stdout.write(sys.stdin.read())
+' 2>/dev/null || echo "$motd_raw")"
 
-            ip="$(echo "$resp" | jq -r '.ip // empty')"
-            [ -z "$ip" ] && ip="$host"
-            
-            port_out="$(echo "$resp" | jq -r '.port // empty')"
-            [ -z "$port_out" ] && port_out="$port"
-            online="$(echo "$resp" | jq -r '.players.online // 0')"
-            max="$(echo "$resp" | jq -r '.players.max // 0')"
+            ip="$(echo "$resp" | jq -r --arg default "$host" '.ip // $default')"
+            port_out="$(echo "$resp" | jq -r --arg default "$port" '.port // $default')"
+            players_online="$(echo "$resp" | jq -r '.players.online // 0')"
+            players_max="$(echo "$resp" | jq -r '.players.max // 0')"
 
             epoch="$(date +%s)"
+            discord_time_tag="<t:${epoch}:t>"
 
-            printf -v message "%s\n%s\n%s\n%s\n" \
-              "Server name: ${motd}" \
-              "Address: ${ip}" \
-              "Port: ${port_out}" \
-              "Player Count (as of <t:${epoch}:t>): ${online}/${max}"
+            # Build the message
+            message="Server name: ${motd}\nAddress: ${ip}\nPort: ${port_out}\nPlayer Count (as of ${discord_time_tag}): ${players_online}/${players_max}"
 
-            payload="$(jq -nc --arg content "$message" '{content:$content}')"
+            # Create JSON payload
+            payload="$(jq -nc --arg c "$message" '{content: $c}')"
 
-            curl -sS -H "Content-Type: application/json" \
-                 -d "$payload" \
-                 "$DISCORD_WEBHOOK" >/dev/null
+            # Send to Discord webhook
+            http_code="$(curl -sS -o /dev/null -w "%{http_code}" \
+              -H "Content-Type: application/json" \
+              -d "$payload" "$DISCORD_WEBHOOK" || echo "000")"
+
+            if [ "$http_code" != "204" ] && [ "$http_code" != "200" ]; then
+              echo "Warning: webhook POST returned HTTP $http_code for server $host:$port_out"
+            else
+              echo "Posted server $host:$port_out -> Discord (http $http_code)"
+            fi
 
             sleep 1
-          done < servers.txt
+          done < "$FILE"
