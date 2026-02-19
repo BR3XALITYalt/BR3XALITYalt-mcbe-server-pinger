@@ -47,7 +47,7 @@ jobs:
             api_url="https://api.mcsrvstat.us/bedrock/2/${host}:${port}"
             echo "Querying $api_url"
 
-            resp="$(curl -sS --max-time 15 "$api_url")" || continue
+            resp="$(curl -sS --max-time 30 "$api_url")" || continue
 
             # Simplified jq filter (single line to avoid YAML/bash parsing issues)
             motd="$(echo "$resp" | jq -r '(.motd.clean // .motd.raw // .hostname // "Unknown") | if type=="array" then join(" ") else . end')"
