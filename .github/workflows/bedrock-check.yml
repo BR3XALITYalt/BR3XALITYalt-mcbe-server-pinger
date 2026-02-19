@@ -57,8 +57,8 @@ jobs:
             motd="${motd//&lt;/<}"
             motd="${motd//&gt;/>}"
 
-            ip="$(echo "$resp" | jq -r --arg d "$host" '.ip // $d')"
-            port_out="$(echo "$resp" | jq -r --arg d "$port" '.port // $d')"
+            ip="$(echo "$resp" | jq -r --arg d "$host" '.ip // $d' 2>/dev/null)"
+            port_out="$(echo "$resp" | jq -r --arg d "$port" '.port // $d' 2>/dev/null)"
             online="$(echo "$resp" | jq -r '.players.online // 0')"
             max="$(echo "$resp" | jq -r '.players.max // 0')"
 
