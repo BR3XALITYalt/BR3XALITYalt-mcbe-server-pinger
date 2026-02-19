@@ -37,10 +37,12 @@ jobs:
 
             host="$line"
             port="19132"
-            if [[ "$line" == *":"* ]]; then
-              host="${line%%:*}"
-              port="${line##*:}"
-            fi
+            case "$line" in
+              *:*)
+                host="${line%%:*}"
+                port="${line##*:}"
+                ;;
+            esac
 
             api_url="https://api.mcsrvstat.us/bedrock/2/${host}:${port}"
             echo "Querying $api_url"
@@ -64,8 +66,8 @@ jobs:
               end // "Unknown"
             ')
 
-            # Decode HTML entities safely (no heredoc)
-            motd="$(printf '%s' "$motd" | python3 -c 'import sys,html; print(html.unescape(sys.stdin.read()))')"
+            # Decode HTML entities safely
+            motd=$(printf '%s' "$motd" | python3 -c 'import sys,html; print(html.unescape(sys.stdin.read()))')
 
             ip="$(echo "$resp" | jq -r --arg default "$host" '.ip // $default')"
             port_out="$(echo "$resp" | jq -r --arg default "$port" '.port // $default')"
@@ -79,10 +81,7 @@ jobs:
 
             payload="$(jq -nc --arg c "$message" '{content: $c}')"
 
-            http_code="$(curl -sS -o /dev/null -w "%{http_code}" \
-              -H "Content-Type: application/json" \
-              -d "$payload" \
-              "$DISCORD_WEBHOOK" || echo "000")"
+            http_code="$(curl -sS -o /dev/null -w "%{http_code}" -H "Content-Type: application/json" -d "$payload" "$DISCORD_WEBHOOK" || echo "000")"
 
             if [ "$http_code" != "204" ] && [ "$http_code" != "200" ]; then
               echo "Warning: webhook POST returned HTTP $http_code for server $host:$port_out"
