@@ -1,10 +1,9 @@
 name: Bedrock server -> Discord webhook
 
-# run every 5 minutes
 on:
   schedule:
     - cron: '*/5 * * * *'
-  workflow_dispatch:    # allows manual run from Actions UI
+  workflow_dispatch:
 
 jobs:
   check-servers:
@@ -15,15 +14,16 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install jq (JSON parser)
+      - name: Install jq + curl
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq curl
 
       - name: Query servers and post to Discord
+        shell: bash
         run: |
           set -u
-          # location of servers list
+
           FILE="servers.txt"
           if [ ! -f "$FILE" ]; then
             echo "Error: $FILE not found in repo root."
@@ -31,32 +31,26 @@ jobs:
           fi
 
           while IFS= read -r rawline || [ -n "$rawline" ]; do
-            # strip comments and carriage returns, trim whitespace
             line="${rawline%%#*}"
             line="$(echo -n "$line" | tr -d '\r' | xargs || true)"
-
             [ -z "$line" ] && continue
 
-            # default bedrock port
             host="$line"
             port="19132"
-            if echo "$line" | grep -q ":"; then
+            if [[ "$line" == *":"* ]]; then
               host="${line%%:*}"
               port="${line##*:}"
             fi
 
             api_url="https://api.mcsrvstat.us/bedrock/2/${host}:${port}"
-
-            # fetch API (don't fail the whole job on a single server error)
             echo "Querying $api_url"
+
             resp="$(curl -sS --max-time 15 "$api_url")" || {
               echo "Warning: failed to fetch $api_url"
               continue
             }
 
-            # parse fields with jq, using fallbacks
             motd="$(echo "$resp" | jq -r '
-              # try motd.clean (array) -> join, or motd.clean (string), or motd.raw, or hostname
               if (.motd? and (.motd.clean? and (.motd.clean | type) == "array")) then
                 (.motd.clean | join(" "))
               elif (.motd? and (.motd.clean? and (.motd.clean | type) == "string")) then
@@ -68,37 +62,37 @@ jobs:
               else
                 empty
               end // "Unknown"
-            ')"
+            ')
+
+            # Proper HTML entity decoding using Python (avoids bash parsing issues)
+            motd="$(python3 - <<'EOF'
+            import sys, html
+            print(html.unescape(sys.stdin.read().strip()))
+            EOF
+            <<< "$motd")"
 
             ip="$(echo "$resp" | jq -r --arg default "$host" '.ip // $default')"
             port_out="$(echo "$resp" | jq -r --arg default "$port" '.port // $default')"
             players_online="$(echo "$resp" | jq -r '.players.online // 0')"
             players_max="$(echo "$resp" | jq -r '.players.max // 0')"
 
-            # epoch seconds for "now" (time of this ping)
             epoch="$(date +%s)"
-
-            # Discord timestamp tag — <t:SECONDS:t> will render as HH:MM (viewer-local)
             discord_time_tag="<t:${epoch}:t>"
 
-            # Build message exactly in requested format
-            # Server name: motd
-            # Address: IP
-            # Port: PORT
-            # Player Count (as of HH:MM LOCAL (via Discord timestamp tag)): current/max
             message="Server name: ${motd}\nAddress: ${ip}\nPort: ${port_out}\nPlayer Count (as of ${discord_time_tag}): ${players_online}/${players_max}"
 
-            # Build JSON payload safely with jq to avoid escaping issues
             payload="$(jq -nc --arg c "$message" '{content: $c}')"
 
-            # Post to Discord webhook (silently ignore non-2xx but print warnings)
-            http_code="$(curl -sS -o /dev/null -w "%{http_code}" -H "Content-Type: application/json" -d "$payload" "$DISCORD_WEBHOOK" || echo "000")"
+            http_code="$(curl -sS -o /dev/null -w "%{http_code}" \
+              -H "Content-Type: application/json" \
+              -d "$payload" \
+              "$DISCORD_WEBHOOK" || echo "000")"
+
             if [ "$http_code" != "204" ] && [ "$http_code" != "200" ]; then
               echo "Warning: webhook POST returned HTTP $http_code for server $host:$port_out"
             else
               echo "Posted server $host:$port_out -> Discord (http $http_code)"
             fi
 
-            # small delay between servers to reduce burstiness
             sleep 1
           done < "$FILE"
