@@ -63,9 +63,16 @@ jobs:
             epoch="$(date +%s)"
             discord_time_tag="<t:${epoch}:t>"
 
-            message="Server name: ${motd}\nAddress: ${ip}\nPort: ${port_out}\nPlayer Count (as of ${discord_time_tag}): ${players_online}/${players_max}"
+            payload=$(
+            jq -nc \
+            --arg name "$motd" \
+            --arg ip "$ip" \
+            --arg port "$port_out" \
+            --arg time "$discord_time_tag" \
+            --arg players "${players_online}/${players_max}" \
+            '{content: "Server name: \($name)\nAddress: \($ip)\nPort: \($port)\nPlayer Count (as of \($time)): \($players)"}'
+            )
 
-            payload="$(jq -nc --arg c "$message" '{content: $c}')"
 
             curl -sS -H "Content-Type: application/json" \
               -d "$payload" \
