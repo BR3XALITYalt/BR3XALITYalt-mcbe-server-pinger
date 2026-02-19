@@ -1,62 +1,72 @@
-name: Bedrock server -> Discord webhook
+name: Bedrock server -> Discord webhook (post on player-count change)
 
-# run every 5 minutes
 on:
   schedule:
-    - cron: '*/5 * * * *'
-  workflow_dispatch:    # allows manual run from Actions UI
+    - cron: '*/10 * * * *'   # every 10 minutes
+  workflow_dispatch:         # manual trigger
 
 jobs:
   check-servers:
     runs-on: ubuntu-latest
     env:
       DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Install jq (JSON parser)
+      - name: Install dependencies
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y jq curl
+          sudo apt-get install -y jq curl python3
 
-      - name: Query servers and post to Discord
+      - name: Query servers and post to Discord when player count changes
+        shell: bash
         run: |
-          set -u
-          # location of servers list
+          set -euo pipefail
+
           FILE="servers.txt"
+          STATUS_FILE="server_status.json"
+
+          # initialize status json if missing
+          if [ ! -f "$STATUS_FILE" ]; then
+            echo '{}' > "$STATUS_FILE"
+            git add "$STATUS_FILE" || true
+            git commit -m "Create server_status.json [skip ci]" || true
+          fi
+
           if [ ! -f "$FILE" ]; then
             echo "Error: $FILE not found in repo root."
             exit 1
           fi
 
+          # read the existing status JSON
+          status_json="$(cat "$STATUS_FILE")"
+
+          changed=0
+
           while IFS= read -r rawline || [ -n "$rawline" ]; do
-            # strip comments and carriage returns, trim whitespace
             line="${rawline%%#*}"
             line="$(echo -n "$line" | tr -d '\r' | xargs || true)"
-
             [ -z "$line" ] && continue
 
-            # default bedrock port
             host="$line"
             port="19132"
-            if echo "$line" | grep -q ":"; then
+            if [[ "$line" == *:* ]]; then
               host="${line%%:*}"
               port="${line##*:}"
             fi
 
             api_url="https://api.mcsrvstat.us/bedrock/2/${host}:${port}"
-
-            # fetch API (don't fail the whole job on a single server error)
             echo "Querying $api_url"
             resp="$(curl -sS --max-time 15 "$api_url")" || {
               echo "Warning: failed to fetch $api_url"
               continue
             }
 
-            # parse fields with jq, using fallbacks
-            motd="$(echo "$resp" | jq -r '
-              # try motd.clean (array) -> join, or motd.clean (string), or motd.raw, or hostname
+            motd_raw="$(echo "$resp" | jq -r '
               if (.motd? and (.motd.clean? and (.motd.clean | type) == "array")) then
                 (.motd.clean | join(" "))
               elif (.motd? and (.motd.clean? and (.motd.clean | type) == "string")) then
@@ -66,39 +76,76 @@ jobs:
               elif .hostname? then
                 .hostname
               else
-                empty
-              end // "Unknown"
+                "Unknown"
+              end
             ')"
+
+            # decode HTML entities reliably
+            motd_decoded="$(python3 - <<'PY' -- "$motd_raw"
+import html,sys
+print(html.unescape(sys.argv[1] if len(sys.argv) > 1 else ""))
+PY
+)"
 
             ip="$(echo "$resp" | jq -r --arg default "$host" '.ip // $default')"
             port_out="$(echo "$resp" | jq -r --arg default "$port" '.port // $default')"
             players_online="$(echo "$resp" | jq -r '.players.online // 0')"
             players_max="$(echo "$resp" | jq -r '.players.max // 0')"
 
-            # epoch seconds for "now" (time of this ping)
             epoch="$(date +%s)"
-
-            # Discord timestamp tag — <t:SECONDS:t> will render as HH:MM (viewer-local)
             discord_time_tag="<t:${epoch}:t>"
 
-            # Build message exactly in requested format
-            # Server name: motd
-            # Address: IP
-            # Port: PORT
-            # Player Count (as of HH:MM LOCAL (via Discord timestamp tag)): current/max
-            message="Server name: ${motd}\nAddress: ${ip}\nPort: ${port_out}\nPlayer Count (as of ${discord_time_tag}): ${players_online}/${players_max}"
+            key="${host}:${port_out}"
 
-            # Build JSON payload safely with jq to avoid escaping issues
-            payload="$(jq -nc --arg c "$message" '{content: $c}')"
+            # get previous players_online from status_json (default -1 if not present)
+            prev_online="$(echo "$status_json" | jq -r --arg k "$key" 'if .[$k] then (.[$k].players_online|tostring) else "-1" end')"
 
-            # Post to Discord webhook (silently ignore non-2xx but print warnings)
-            http_code="$(curl -sS -o /dev/null -w "%{http_code}" -H "Content-Type: application/json" -d "$payload" "$DISCORD_WEBHOOK" || echo "000")"
-            if [ "$http_code" != "204" ] && [ "$http_code" != "200" ]; then
-              echo "Warning: webhook POST returned HTTP $http_code for server $host:$port_out"
-            else
-              echo "Posted server $host:$port_out -> Discord (http $http_code)"
+            post_now=0
+            if [ "$prev_online" = "-1" ]; then
+              # no prior record -> treat as first run and post
+              post_now=1
+            elif [ "$prev_online" != "$players_online" ]; then
+              post_now=1
             fi
 
-            # small delay between servers to reduce burstiness
+            if [ "$post_now" -eq 1 ]; then
+              printf -v message "%s\n%s\n%s\n%s\n" \
+                "Server name: ${motd_decoded}" \
+                "Address: ${ip}" \
+                "Port: ${port_out}" \
+                "Player Count (as of ${discord_time_tag}): ${players_online}/${players_max}"
+
+              payload="$(jq -nc --arg content "$message" '{content: $content}')"
+
+              http_code="$(curl -sS -o /dev/null -w "%{http_code}" -H "Content-Type: application/json" -d "$payload" "$DISCORD_WEBHOOK" || echo "000")"
+              if [[ "$http_code" == "200" || "$http_code" == "204" ]]; then
+                echo "Posted $key -> Discord (HTTP $http_code) (prev_online=${prev_online})"
+              else
+                echo "Warning: webhook POST returned HTTP $http_code for $key"
+              fi
+            else
+              echo "No change for $key (players ${players_online}); skipping post."
+            fi
+
+            # update status_json with new values for this server
+            status_json="$(echo "$status_json" | jq --arg k "$key" --argjson online "$players_online" --argjson max "$players_max" --arg epoch "$epoch" '. + {($k): {players_online: $online, players_max: $max, last_checked: ($epoch|tonumber)}}')"
+            changed=1
+
             sleep 1
           done < "$FILE"
+
+          # write back the updated status_json
+          echo "$status_json" > "$STATUS_FILE"
+
+          # commit & push only if there are changes
+          if [[ -n "$(git status --porcelain)" ]]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add "$STATUS_FILE"
+            git commit -m "Update server_status.json [skip ci]" || echo "Commit failed or no changes"
+            # push using GITHUB_TOKEN
+            repo_url="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+            git push "$repo_url" HEAD:$(git rev-parse --abbrev-ref HEAD) || echo "Push failed (protected branch?)"
+          else
+            echo "No changes to commit."
+          fi
