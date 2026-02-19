@@ -47,27 +47,13 @@ jobs:
             api_url="https://api.mcsrvstat.us/bedrock/2/${host}:${port}"
             echo "Querying $api_url"
 
-            resp="$(curl -sS --max-time 15 "$api_url")" || {
-              echo "Warning: failed to fetch $api_url"
-              continue
-            }
+            resp="$(curl -sS --max-time 15 "$api_url")" || continue
 
-            motd="$(echo "$resp" | jq -r '
-              if (.motd? and (.motd.clean? and (.motd.clean | type) == "array")) then
-                (.motd.clean | join(" "))
-              elif (.motd? and (.motd.clean? and (.motd.clean | type) == "string")) then
-                .motd.clean
-              elif (.motd? and .motd.raw?) then
-                .motd.raw
-              elif .hostname? then
-                .hostname
-              else
-                empty
-              end // "Unknown"
-            ')
+            # Simplified jq filter (single line to avoid YAML/bash parsing issues)
+            motd="$(echo "$resp" | jq -r '(.motd.clean // .motd.raw // .hostname // "Unknown") | if type=="array" then join(" ") else . end')"
 
-            # Decode HTML entities safely (no nested parentheses issues)
-            motd="$(printf '%s' "$motd" | python3 -c "import sys,html; print(html.unescape(sys.stdin.read()))")"
+            # Minimal HTML entity fix for apostrophes
+            motd="${motd//&#039;/'}"
 
             ip="$(echo "$resp" | jq -r --arg default "$host" '.ip // $default')"
             port_out="$(echo "$resp" | jq -r --arg default "$port" '.port // $default')"
@@ -81,13 +67,9 @@ jobs:
 
             payload="$(jq -nc --arg c "$message" '{content: $c}')"
 
-            http_code="$(curl -sS -o /dev/null -w "%{http_code}" -H "Content-Type: application/json" -d "$payload" "$DISCORD_WEBHOOK" || echo "000")"
-
-            if [ "$http_code" != "204" ] && [ "$http_code" != "200" ]; then
-              echo "Warning: webhook POST returned HTTP $http_code for server $host:$port_out"
-            else
-              echo "Posted server $host:$port_out -> Discord (http $http_code)"
-            fi
+            curl -sS -H "Content-Type: application/json" \
+              -d "$payload" \
+              "$DISCORD_WEBHOOK" >/dev/null
 
             sleep 1
           done < "$FILE"
