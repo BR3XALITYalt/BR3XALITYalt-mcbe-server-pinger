@@ -70,7 +70,7 @@ jobs:
             --arg port "$port_out" \
             --arg time "$discord_time_tag" \
             --arg players "${players_online}/${players_max}" \
-            '{content: "Server name: \($name)\nAddress: \($ip)\nPort: \($port)\nPlayer Count (as of \($time)): \($players)"}'
+            '{content: "Server name: \($name)\nAddress: \($ip)\nPort: \($port)\nPlayer Count (as of \($time)): \($players)\n_________________________"}'
             )
 
 
